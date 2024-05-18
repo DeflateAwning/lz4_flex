@@ -69,6 +69,8 @@ pub struct FrameDecoder<R: io::Read> {
     dst_start: usize,
     /// Index into dst: ending point of bytes not yet read by caller.
     dst_end: usize,
+    /// The total number of bytes read so far.
+    total_in: u64,
 }
 
 impl<R: io::Read> FrameDecoder<R> {
@@ -85,6 +87,7 @@ impl<R: io::Read> FrameDecoder<R> {
             current_frame_info: None,
             content_hasher: XxHash32::with_seed(0),
             content_len: 0,
+            total_in: 0,
         }
     }
 
@@ -106,38 +109,55 @@ impl<R: io::Read> FrameDecoder<R> {
         self.r
     }
 
-    /// Returns the total number of uncompressed bytes read so far
+    /// Returns the total number of compressed bytes read so far.
+    /// This includes the frame header and block headers.
+    pub fn total_in(&self) -> u64 {
+        self.total_in
+    }
+
+    /// Returns the total number of uncompressed bytes returned so far.
     pub fn total_out(&self) -> u64 {
         self.content_len
+    }
+
+    /// Performs `self.r.read()`, and tracks the total number of bytes read.
+    fn r_read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.r.read(buf)?;
+        self.total_in += n as u64;
+        Ok(n)
+    }
+
+    /// Performs `self.r.read_exact()`, and tracks the total number of bytes read.
+    fn r_read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        self.r.read_exact(buf)?;
+        self.total_in += buf.len() as u64;
+        Ok(())
     }
 
     fn read_frame_info(&mut self) -> Result<usize, io::Error> {
         let mut buffer = [0u8; MAX_FRAME_INFO_SIZE];
 
-        match self.r.read(&mut buffer[..MAGIC_NUMBER_SIZE])? {
+        match self.r_read(&mut buffer[..MAGIC_NUMBER_SIZE])? {
             0 => return Ok(0),
             MAGIC_NUMBER_SIZE => (),
-            read => self.r.read_exact(&mut buffer[read..MAGIC_NUMBER_SIZE])?,
+            read => self.r_read_exact(&mut buffer[read..MAGIC_NUMBER_SIZE])?,
         }
 
         if u32::from_le_bytes(buffer[0..MAGIC_NUMBER_SIZE].try_into().unwrap())
             != LZ4F_LEGACY_MAGIC_NUMBER
         {
             match self
-                .r
-                .read(&mut buffer[MAGIC_NUMBER_SIZE..MIN_FRAME_INFO_SIZE])?
+                .r_read(&mut buffer[MAGIC_NUMBER_SIZE..MIN_FRAME_INFO_SIZE])?
             {
                 0 => return Ok(0),
                 MIN_FRAME_INFO_SIZE => (),
                 read => self
-                    .r
-                    .read_exact(&mut buffer[MAGIC_NUMBER_SIZE + read..MIN_FRAME_INFO_SIZE])?,
+                    .r_read_exact(&mut buffer[MAGIC_NUMBER_SIZE + read..MIN_FRAME_INFO_SIZE])?,
             }
         }
         let required = FrameInfo::read_size(&buffer[..MIN_FRAME_INFO_SIZE])?;
         if required != MIN_FRAME_INFO_SIZE && required != MAGIC_NUMBER_SIZE {
-            self.r
-                .read_exact(&mut buffer[MIN_FRAME_INFO_SIZE..required])?;
+            self.r_read_exact(&mut buffer[MIN_FRAME_INFO_SIZE..required])?;
         }
 
         let frame_info = FrameInfo::read(&buffer[..required])?;
@@ -235,7 +255,7 @@ impl<R: io::Read> FrameDecoder<R> {
         // Read and decompress block
         let block_info = {
             let mut buffer = [0u8; 4];
-            if let Err(err) = self.r.read_exact(&mut buffer) {
+            if let Err(err) = self.r_read_exact(&mut buffer) {
                 if err.kind() == ErrorKind::UnexpectedEof {
                     return Ok(0);
                 } else {
@@ -252,11 +272,12 @@ impl<R: io::Read> FrameDecoder<R> {
                 }
                 // TODO: Attempt to avoid initialization of read buffer when
                 // https://github.com/rust-lang/rust/issues/42788 stabilizes
-                self.r.read_exact(vec_resize_and_get_mut(
+                self.r_read_exact(vec_resize_and_get_mut(
                     &mut self.dst,
                     self.dst_start,
                     self.dst_start + len,
                 ))?;
+                self.total_in += len as u64;
                 if frame_info.block_checksums {
                     let expected_checksum = Self::read_checksum(&mut self.r)?;
                     Self::check_block_checksum(
@@ -275,8 +296,7 @@ impl<R: io::Read> FrameDecoder<R> {
                 }
                 // TODO: Attempt to avoid initialization of read buffer when
                 // https://github.com/rust-lang/rust/issues/42788 stabilizes
-                self.r
-                    .read_exact(vec_resize_and_get_mut(&mut self.src, 0, len))?;
+                self.r_read_exact(vec_resize_and_get_mut(&mut self.src, 0, len))?;
                 if frame_info.block_checksums {
                     let expected_checksum = Self::read_checksum(&mut self.r)?;
                     Self::check_block_checksum(&self.src[..len], expected_checksum)?;
